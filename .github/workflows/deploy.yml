@@ -1,0 +1,64 @@
+name: Deploy to Cloud Run
+
+on:
+  push:
+    branches: [main]
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: us-central1
+  SERVICE: security-txt-validator
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and push to Artifact Registry
+        run: gcloud builds submit --tag gcr.io/$PROJECT_ID/$SERVICE
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy $SERVICE \
+            --image gcr.io/$PROJECT_ID/$SERVICE \
+            --region $REGION \
+            --platform managed \
+            --allow-unauthenticated \
+            --port 8080 \
+            --memory 256Mi \
+            --cpu 1 \
+            --min-instances 0 \
+            --max-instances 10 \
+            --concurrency 80 \
+            --timeout 30s \
+            --set-env-vars "NODE_ENV=production"
+
+      - name: Show URL
+        run: |
+          gcloud run services describe $SERVICE \
+            --region $REGION \
+            --format "value(status.url)"
