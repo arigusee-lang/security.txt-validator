@@ -1,7 +1,10 @@
-﻿import type { CheckStatus, CtLogEntry, CtLogsResult, CtFinding, CtDataSource, CtCheckOptions, CaaRecord } from "../types.js";
+﻿import type { CheckStatus, CtLogEntry, CtLogsResult, CtFinding, CtDataSource, CtSourcePref, CtCheckOptions, CaaRecord } from "../types.js";
 import { cacheGetMaybeStale, cacheSet } from "../lib/cache.js";
 import { ssrfSafeTlsConnect } from "../lib/ipCheck.js";
+import { fetchFromCrtShPg } from "./crtShPg.js";
+import { parseIssuerO, pickBestName, finalizeCerts } from "./ctNormalize.js";
 import { createLogger } from "../lib/logger.js";
+import { incr } from "../lib/metrics.js";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -133,43 +136,6 @@ export function normalizeCAName(name: string): string {
     .trim();
 }
 
-/**
- * Extract Organization (O=) from a certificate DN.
- * crt.sh returns issuer_name as a full DN string ("C=US, O=Let's Encrypt, CN=E8")
- * — unreadable in the UI and breaks dedup (same root, different intermediate CN
- * yields different DN). CertSpotter gives a friendly_name, but its `name` fallback
- * is also DN-shaped. We use the O= field as the human-friendly issuer everywhere.
- *
- * Note: DN attributes can be RFC 4514 escaped (e.g. `O=Foo\, Inc.`) — we don't
- * handle that edge case; for the public-CA universe O= values rarely contain commas.
- */
-function parseIssuerO(rawIssuer: string | undefined | null): string {
-  if (!rawIssuer) return "Unknown";
-  // Not DN-shaped (no "ATTR=" pattern) — assume it's already a friendly name
-  if (!/[A-Za-z]+=/.test(rawIssuer)) return rawIssuer;
-  for (const part of rawIssuer.split(/,\s*/)) {
-    if (/^o=/i.test(part)) {
-      return part.substring(2).trim().replace(/^"|"$/g, "");
-    }
-  }
-  return rawIssuer;
-}
-
-/** Pick the best domain name from a list of SANs — prefer exact match or wildcard match for the searched domain */
-function pickBestName(names: string[], domain: string): string {
-  if (!names || names.length === 0) return domain;
-  // Exact match
-  const exact = names.find(n => n === domain);
-  if (exact) return exact;
-  // Wildcard match (*.domain)
-  const wc = names.find(n => n === `*.${domain}`);
-  if (wc) return wc;
-  // Subdomain match (anything ending with .domain)
-  const sub = names.find(n => n.endsWith(`.${domain}`));
-  if (sub) return sub;
-  return names[0];
-}
-
 function isKnownCA(issuerName: string): boolean {
   const norm = normalizeCAName(issuerName);
   return MOZILLA_CAS.some(
@@ -184,6 +150,13 @@ async function fetchWithRetry<T>(fn: () => Promise<T>, retries: number, delays: 
       return await fn();
     } catch (err: any) {
       lastError = err;
+      // Don't retry timeouts. A timeout means the upstream is overloaded (crt.sh's
+      // public Postgres is slow for mega-domains under load) — an immediate retry
+      // just burns another full timeout before we fall back. Retry only transient
+      // errors (connection resets, etc.); fail fast on timeout so the fallback
+      // source kicks in quickly.
+      const msg = String(err?.message ?? err);
+      if (err?.name === "AbortError" || /timeout/i.test(msg)) break;
       if (attempt < retries) await new Promise((r) => setTimeout(r, delays[attempt] ?? 1000));
     }
   }
@@ -221,32 +194,48 @@ async function fetchSslIssuer(domain: string, timeoutMs = 5000): Promise<string 
   }
 }
 
-async function fetchFromCrtSh(domain: string, authenticated: boolean): Promise<{ certs: CtLogEntry[]; total: number }> {
-  const c = new AbortController(); const t = setTimeout(() => c.abort(), 20000);
-  const q = authenticated ? encodeURIComponent("%." + domain) : encodeURIComponent(domain);
-  try {
-    const res = await fetch(`https://crt.sh/?identity=${q}&output=json&exclude=expired&deduplicate=Y`, { signal: c.signal, headers: { "User-Agent": "dn-sec/1.0", Accept: "application/json" } });
-    if (!res.ok) {
-      log.warn({ upstream: "crt.sh", status: res.status, domain }, "upstream returned non-2xx");
-      throw new Error(`crt.sh HTTP ${res.status}`);
-    }
-    const text = await res.text(); if (!text?.trim()) return { certs: [], total: 0 };
-    let data: any[]; try { data = JSON.parse(text); } catch { throw new Error("Invalid JSON"); }
-    if (!Array.isArray(data)) return { certs: [], total: 0 };
-    const seen = new Set<string>(); const certs: CtLogEntry[] = [];
-    for (const e of data) {
-      const names = e.name_value ? e.name_value.split(/\n/) : [e.common_name || domain];
-      const cn = pickBestName(names, domain);
-      // Parse DN → friendly issuer org. Same parsing is used for the dedup
-      // key so different intermediates of the same root collapse to one row.
-      const issuer = parseIssuerO(e.issuer_name);
-      const k = `${cn}|${(e.not_before || "").slice(0, 10)}|${issuer}`;
-      if (seen.has(k)) continue; seen.add(k);
-      certs.push({ issuerName: issuer, commonName: cn, notBefore: e.not_before || "", notAfter: e.not_after || "" });
-      if (certs.length >= 50) break;
-    }
-    return { certs, total: data.length };
-  } finally { clearTimeout(t); }
+type FetchResult = { certs: CtLogEntry[]; total: number; lastId?: string | null; source: CtDataSource };
+
+/**
+ * Default order the CT sources are tried in. The crt.sh Postgres mirror is the
+ * primary (fast, 200ms–2s, full archive); CertSpotter is the fallback (recent
+ * window, paginated with a key). When the admin picks a preferred source it's
+ * moved to the front and the other stays as fallback.
+ *
+ * The crt.sh HTTP frontend was dropped: it's strictly worse than the PG mirror
+ * (same dataset, but slow and routinely 502s) with no compensating upside.
+ */
+const DEFAULT_CT_ORDER: CtSourcePref[] = ["crt.sh-pg", "certspotter"];
+
+/**
+ * Short, cache-key-safe tag for a preferred CT source. Different source
+ * selections must not share a cache entry (they can return different data),
+ * so callers include this in the CT cache key. Undefined → "def" (default chain).
+ */
+export function ctSourceTag(src?: CtSourcePref): string {
+  switch (src) {
+    case "crt.sh-pg": return "pg";
+    case "certspotter": return "cs";
+    default: return "def";
+  }
+}
+
+/** Build the fetchers for each source, all normalised to {certs,total,lastId?,source}. */
+function ctFetchers(
+  domain: string,
+  authenticated: boolean,
+  startAfterId: string | undefined,
+): Record<CtSourcePref, () => Promise<FetchResult>> {
+  return {
+    certspotter: async () => {
+      const r = await fetchAllFromCertSpotter(domain, authenticated, startAfterId);
+      return { certs: r.certs, total: r.total, lastId: r.lastId, source: "certspotter" };
+    },
+    "crt.sh-pg": async () => {
+      const r = await fetchFromCrtShPg(domain, authenticated);
+      return { certs: r.certs, total: r.total, source: "crt.sh-pg" };
+    },
+  };
 }
 
 async function fetchAllFromCertSpotter(domain: string, authenticated: boolean, startAfterId?: string): Promise<{ certs: CtLogEntry[]; total: number; lastId: string | null }> {
@@ -254,8 +243,10 @@ async function fetchAllFromCertSpotter(domain: string, authenticated: boolean, s
   const headers: Record<string, string> = { "User-Agent": "dn-sec/1.0", Accept: "application/json" };
   if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
   const subdomains = authenticated ? "true" : "false";
-  const allCerts: CtLogEntry[] = []; const seen = new Set<string>();
-  let after = startAfterId || ""; let pages = 0; let totalBeforeDedup = 0; let lastId: string | null = null;
+  // Collect raw rows only; the shared finalizeCerts dedups + sorts + caps so all
+  // sources are processed identically.
+  const allCerts: CtLogEntry[] = [];
+  let after = startAfterId || ""; let pages = 0; let lastId: string | null = null;
   while (pages < 50) {
     const c = new AbortController(); const t = setTimeout(() => c.abort(), 15000);
     try {
@@ -268,14 +259,11 @@ async function fetchAllFromCertSpotter(domain: string, authenticated: boolean, s
       }
       const data: any[] = await res.json();
       if (!Array.isArray(data) || data.length === 0) break;
-      totalBeforeDedup += data.length;
       for (const e of data) {
         const bestName = pickBestName(e.dns_names, domain);
         // Prefer friendly_name, then organization, then parse DN out of `name` —
         // any of these can be missing depending on the cert / API tier.
         const issuer = e.issuer?.friendly_name || e.issuer?.organization || parseIssuerO(e.issuer?.name) || "Unknown";
-        const key = `${bestName}|${(e.not_before || "").slice(0, 10)}|${issuer}`;
-        if (seen.has(key)) continue; seen.add(key);
         allCerts.push({ id: String(e.id || ""), issuerName: issuer, commonName: bestName, notBefore: e.not_before || "", notAfter: e.not_after || "" });
       }
       lastId = String(data[data.length - 1].id);
@@ -286,7 +274,7 @@ async function fetchAllFromCertSpotter(domain: string, authenticated: boolean, s
       throw err;
     } finally { clearTimeout(t); }
   }
-  return { certs: allCerts, total: totalBeforeDedup, lastId };
+  return { certs: allCerts, total: allCerts.length, lastId };
 }
 
 /**
@@ -334,10 +322,13 @@ export function analyzeFindings(certs: CtLogEntry[], totalCerts: number, domain:
 
   for (const [issuer, subdomains] of caaViolations) {
     if (subdomains.length === 1) {
+      // Single-tenant CAA violation → real misissuance signal; bump from warn
+      // to fail so the score reflects the severity. Multi-tenant SaaS noise is
+      // handled in the else-branch below (warn or info via multiTenant check).
       f.push({
-        severity: "warn",
+        severity: "fail",
         title: `Cert issued by CA not in CAA: ${issuer}`,
-        description: `Certificate for "${subdomains[0]}" issued by "${issuer}" which is not authorized in CAA records.`,
+        description: `Certificate for "${subdomains[0]}" issued by "${issuer}" which is not authorized in CAA records. This is a strong misissuance signal — investigate immediately.`,
         subdomain: subdomains[0],
       });
     } else {
@@ -447,9 +438,12 @@ export function analyzeFindings(certs: CtLogEntry[], totalCerts: number, domain:
       }
     }
   }
+  // Wildcards and cert volume are operational metrics, not security signals —
+  // many wildcards are a legit SaaS pattern, and high cert counts are normal
+  // for large orgs. Surface as info only; don't penalize the score.
   const wc = new Set<string>(); for (const c of certs) if (c.commonName.startsWith("*.")) wc.add(c.commonName);
-  if (wc.size > 0) f.push({ severity: wc.size > 3 ? "warn" : "info", title: `${wc.size} wildcard cert${wc.size > 1 ? "s" : ""} found`, description: wc.size > 3 ? `${wc.size} unique wildcard certs - expanded attack surface.` : `Wildcards: ${[...wc].join(", ")}`, subdomain: [...wc][0] });
-  if (totalCerts > 500) f.push({ severity: "warn", title: `High cert count: ${totalCerts}`, description: "Verify all certificates are legitimate." });
+  if (wc.size > 0) f.push({ severity: "info", title: `${wc.size} wildcard cert${wc.size > 1 ? "s" : ""} found`, description: wc.size > 3 ? `${wc.size} unique wildcard certs — check that they're all expected.` : `Wildcards: ${[...wc].join(", ")}`, subdomain: [...wc][0] });
+  if (totalCerts > 500) f.push({ severity: "info", title: `High cert count: ${totalCerts}`, description: "Above 500 certs — normal for large orgs / SaaS; verify all are legitimate." });
   else if (totalCerts > 100) f.push({ severity: "info", title: `${totalCerts} certs in CT logs`, description: "Above average but may be normal for large orgs." });
   return f;
 }
@@ -471,30 +465,34 @@ export function splitCerts(certs: CtLogEntry[], findings: CtFinding[]): { flagge
 
 export async function checkCtLogs(domain: string, opts?: CtCheckOptions): Promise<CtLogsResult> {
   const authenticated = opts?.authenticated ?? false;
-  const crtShFirst = opts?.crtShFirst ?? false;
   const startAfterId = opts?.startAfterId;
+  // Preferred source; undefined = default order (crt.sh-pg → certspotter).
+  const preferred: CtSourcePref | undefined = opts?.ctSource;
 
-  const primaryFn = crtShFirst
-    ? () => fetchWithRetry(() => fetchFromCrtSh(domain, authenticated), 2, [1000, 2000])
-    : () => fetchWithRetry(() => fetchAllFromCertSpotter(domain, authenticated, startAfterId), 2, [1000, 2000]);
-  const fallbackFn = crtShFirst
-    ? () => fetchWithRetry(() => fetchAllFromCertSpotter(domain, authenticated, startAfterId), 1, [1000])
-    : () => fetchWithRetry(() => fetchFromCrtSh(domain, authenticated), 1, [1000]);
-  const primarySource: CtDataSource = crtShFirst ? "crt.sh" : "certspotter";
-  const fallbackSource: CtDataSource = crtShFirst ? "certspotter" : "crt.sh";
-  let result: { certs: CtLogEntry[]; total: number; lastId?: string | null } | null = null;
+  // Try sources in order: preferred (if any) first, then the default order for the rest.
+  // The chosen source gets 2 retries; each fallback gets 1.
+  const order: CtSourcePref[] = preferred
+    ? [preferred, ...DEFAULT_CT_ORDER.filter(s => s !== preferred)]
+    : DEFAULT_CT_ORDER;
+  const fetchers = ctFetchers(domain, authenticated, startAfterId);
+
+  let result: FetchResult | null = null;
   let source: CtDataSource = "none";
-  try { result = await primaryFn(); source = primarySource; } catch (e: any) {
-    const reason = e?.name === "AbortError" ? "timeout (10s)" : e?.message || e;
-    log.warn({ source: primarySource, domain, reason, errName: e?.name || "Error" }, "primary source failed after retries");
-  }
-  if (!result) {
+  for (let i = 0; i < order.length; i++) {
+    const src = order[i];
+    const isPrimary = i === 0;
     try {
-      log.warn({ source: fallbackSource, domain }, "falling back");
-      result = await fallbackFn(); source = fallbackSource;
+      if (!isPrimary) log.warn({ source: src, domain }, "falling back");
+      result = await fetchWithRetry(fetchers[src], isPrimary ? 2 : 1, isPrimary ? [1000, 2000] : [1000]);
+      source = result.source;
+      break;
     } catch (e: any) {
       const reason = e?.name === "AbortError" ? "timeout (10s)" : e?.message || e;
-      log.warn({ source: fallbackSource, domain, reason, errName: e?.name || "Error" }, "fallback source failed");
+      const last = i === order.length - 1;
+      log.warn(
+        { source: src, domain, reason, errName: e?.name || "Error" },
+        last ? "all CT sources failed" : (isPrimary ? "primary source failed after retries" : "fallback source failed"),
+      );
     }
   }
   // Race fallback: /external can outrun /web, leaving sslIssuer null and silently
@@ -510,29 +508,35 @@ export async function checkCtLogs(domain: string, opts?: CtCheckOptions): Promis
   }
 
   if (result) {
-    // Always sort by notBefore desc so downstream cache + UI both see a recent-first list.
-    // Avoids the "head-of-id-window looks like recent" bug when CertSpotter returns the
-    // earliest 100 entries on the free tier.
-    result.certs.sort((a, b) => (b.notBefore || "").localeCompare(a.notBefore || ""));
+    // Uniform post-processing for every source: collapse true duplicates
+    // (precert + leaf), sort recent-first, cap. `total` is the unique cert count.
+    // The recent-first sort also avoids the "head-of-id-window looks like recent"
+    // bug when CertSpotter returns the earliest 100 entries on the free tier.
+    const { certs, total } = finalizeCerts(result.certs);
     await cacheSet(
       `ct-long:${domain}:${authenticated ? "s1" : "s0"}`,
-      { certs: result.certs, totalCerts: result.total, cachedAt: new Date().toISOString(), source } as CtCacheEntry,
+      { certs, totalCerts: total, cachedAt: new Date().toISOString(), source } as CtCacheEntry,
       CT_LONG_TTL,
       CT_STALE_TTL,
     );
-    const findings = analyzeFindings(result.certs, result.total, domain, { sslIssuer: effectiveSslIssuer, caaRecords: opts?.caaRecords });
-    const { flaggedCerts, recentCerts } = splitCerts(result.certs, findings);
-    return { status: computeStatus(findings, result.total > 0), totalCerts: result.total, recentCerts, flaggedCerts, findings, source, lastCertSpotterId: result.lastId ?? undefined };
+    const findings = analyzeFindings(certs, total, domain, { sslIssuer: effectiveSslIssuer, caaRecords: opts?.caaRecords });
+    const { flaggedCerts, recentCerts } = splitCerts(certs, findings);
+    incr("ct_source", { source, result: "fresh" });
+    return { status: computeStatus(findings, total > 0), totalCerts: total, recentCerts, flaggedCerts, findings, source, lastCertSpotterId: result.lastId ?? undefined };
   }
   if (cachedAny) {
     const { data: cached, ageMs, isStale } = cachedAny;
     const staleSeconds = Math.round(ageMs / 1000);
     log.warn({ domain, stale: isStale, ageSeconds: staleSeconds, source: cached.source }, "using cached CT data");
-    const findings = analyzeFindings(cached.certs, cached.totalCerts, domain, { sslIssuer: effectiveSslIssuer, caaRecords: opts?.caaRecords });
-    const { flaggedCerts, recentCerts } = splitCerts(cached.certs, findings);
+    incr("ct_source", { source: cached.source, result: isStale ? "stale" : "cache" });
+    // Re-finalize so entries cached before the unified pipeline (or by another
+    // code path) are deduped/sorted/capped the same way as fresh fetches.
+    const { certs, total } = finalizeCerts(cached.certs);
+    const findings = analyzeFindings(certs, total, domain, { sslIssuer: effectiveSslIssuer, caaRecords: opts?.caaRecords });
+    const { flaggedCerts, recentCerts } = splitCerts(certs, findings);
     return {
       status: "info",
-      totalCerts: cached.totalCerts,
+      totalCerts: total,
       recentCerts,
       flaggedCerts,
       findings,
@@ -543,5 +547,6 @@ export async function checkCtLogs(domain: string, opts?: CtCheckOptions): Promis
     };
   }
   log.warn({ domain }, "all CT sources unavailable");
+  incr("ct_source", { source: "none", result: "none" });
   return { status: "info", totalCerts: 0, recentCerts: [], flaggedCerts: [], findings: [], source: "none", error: "CT log sources temporarily unavailable" };
 }

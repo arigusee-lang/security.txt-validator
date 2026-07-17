@@ -12,7 +12,6 @@
   import SslCard from './SslCard.svelte';
   import CtLogsCard from './CtLogsCard.svelte';
   import RedirectCard from './RedirectCard.svelte';
-  import SeoCard from './SeoCard.svelte';
   import ReputationCard from './ReputationCard.svelte';
   import { runScanStream, type ScanSection } from '../lib/scanStream';
   import { calculateClientScore } from '../lib/scoreClient';
@@ -24,7 +23,6 @@
   let expiry: any = null;
   let ct: any = null;
   let redirects: any = null;
-  let seo: any = null;
   let reputation: any = null;
 
   let loading = false;
@@ -63,20 +61,45 @@
   const unsubUser = currentUser.subscribe(v => (user = v));
   onDestroy(() => unsubUser());
 
-  $: hasAny = dns || web || expiry || ct || redirects || seo || reputation;
+  $: hasAny = dns || web || expiry || ct || redirects || reputation;
 
   $: allDone = !loading;
   $: coreLoaded = !!(dns && web);
 
+  // Worst-of helper for per-card aggregation. Matches the order in
+  // SummaryBar.svelte (fail > warn > pass > info).
+  function worstOf(...statuses: Array<string | undefined | null>): 'pass' | 'warn' | 'fail' | 'info' {
+    const order: Record<string, number> = { fail: 3, warn: 2, pass: 1, info: 0 };
+    let worst: 'pass' | 'warn' | 'fail' | 'info' = 'info';
+    for (const s of statuses) {
+      if (!s) continue;
+      if ((order[s] ?? 0) > order[worst]) worst = s as any;
+    }
+    return worst;
+  }
+
+  // SummaryBar counts one entry per visible *card*, not per sub-check.
+  // That way the counts match what the user sees on the page (e.g. a single
+  // "DNS & Domain" warning chip even if DNSSEC alone tripped — instead of 5
+  // separate chips for sub-checks where only one fires).
   $: summaryChecks = [
-    ...(web?.securityTxt ? [{ label: 'security.txt', status: web.securityTxt.status }] : []),
     ...(web?.headers?.items?.length ? [{ label: 'Headers', status: web.headers.status }] : []),
-    ...(dns?.spf ? [{ label: 'SPF', status: dns.spf.status }] : []),
-    ...(dns?.dmarc ? [{ label: 'DMARC', status: dns.dmarc.status }] : []),
-    ...(dns?.dnssec ? [{ label: 'DNSSEC', status: dns.dnssec.status }] : []),
+    ...((dns?.dnssec || dns?.caa || dns?.ns || dns?.danglingDns || expiry) ? [{
+      label: 'DNS & Domain',
+      status: worstOf(dns?.dnssec?.status, dns?.caa?.status, dns?.ns?.status, dns?.danglingDns?.status, expiry?.status),
+    }] : []),
+    ...((reputation?.safeBrowsing || reputation?.urlhaus || dns?.blacklist) ? [{
+      label: 'Reputation',
+      status: worstOf(reputation?.safeBrowsing?.status, reputation?.urlhaus?.status, dns?.blacklist?.status),
+    }] : []),
+    ...((dns?.spf || dns?.dmarc || dns?.dkim || dns?.mx) ? [{
+      label: 'Email',
+      status: worstOf(dns?.spf?.status, dns?.dmarc?.status, dns?.dkim?.status, dns?.mx?.status),
+    }] : []),
+    ...(web?.securityTxt ? [{ label: 'security.txt', status: web.securityTxt.status }] : []),
     ...(web?.ssl ? [{ label: 'SSL/TLS', status: web.ssl.status }] : []),
+    ...(ct ? [{ label: 'CT logs', status: ct.status }] : []),
     ...(redirects ? [{ label: 'Redirects', status: redirects.status }] : []),
-    ...(dns?.blacklist ? [{ label: 'Blacklist', status: dns.blacklist.status }] : []),
   ];
 
   let failedGroups: string[] = [];
@@ -87,7 +110,6 @@
     web: 'Web checks (security.txt, headers, SSL/TLS)',
     ct: 'Certificate Transparency',
     redirects: 'HTTPS & Redirects',
-    seo: 'SEO Basics',
     reputation: 'Domain Reputation',
   };
 
@@ -100,13 +122,10 @@
 
     if (d && scanIdParam && viewParam === 'history') {
       loadFromHistory(scanIdParam, d);
-    } else if (d && !viewParam) {
-      // Live scan with domain in URL — only trigger if not already scanning this domain
-      historyMode = false;
     } else if (!d) {
       // Clean URL like /#/ — reset everything
       historyMode = false;
-      dns = web = expiry = ct = redirects = seo = reputation = null;
+      dns = web = expiry = ct = redirects = reputation = null;
       scoreData = null;
       diffData = null;
       savedToHistory = false;
@@ -129,6 +148,7 @@
     historyMode = true;
     historyDomain = domain;
     scannedDomain = domain;
+    activeScanId = scanId;
     historyBatch = null;
     loading = true;
     errorMessage = '';
@@ -159,7 +179,6 @@
           expiry = r.domainExpiry;
           ct = r.ctLogs;
           redirects = r.redirects;
-          seo = r.seo;
           reputation = { safeBrowsing: r.safeBrowsing, urlhaus: r.urlhaus };
         } else {
           // Section-grouped format from incremental finalize
@@ -168,7 +187,6 @@
           expiry = r.expiry || null;
           ct = r.ct || null;
           redirects = r.redirects || null;
-          seo = r.seo || null;
           reputation = r.reputation || null;
         }
       }
@@ -194,7 +212,7 @@
     caa: 'dns', mx: 'dns', ns: 'dns', blacklist: 'dns', danglingDns: 'dns',
     domainExpiry: 'expiry',
     securityTxt: 'web', headers: 'web', ssl: 'web',
-    redirects: 'redirects', seo: 'seo',
+    redirects: 'redirects',
     safeBrowsing: 'reputation', urlhaus: 'reputation', ctLogs: 'ct',
   };
 
@@ -216,7 +234,6 @@
       case 'headers':        web = { ...(web || {}), headers: data }; break;
       case 'ssl':            web = { ...(web || {}), ssl: data }; break;
       case 'redirects':      redirects = data; break;
-      case 'seo':            seo = data; break;
       case 'safeBrowsing':   reputation = { ...(reputation || {}), safeBrowsing: data }; break;
       case 'urlhaus':        reputation = { ...(reputation || {}), urlhaus: data }; break;
       case 'ctLogs':         ct = data; break;
@@ -224,13 +241,16 @@
   }
 
   let cancelStream: (() => void) | null = null;
+  // scanId of the scan we launched ourselves — lets handleHashChange tell apart
+  // "our own live scan set the hash" from "user refreshed / navigated to a scanId URL".
+  let activeScanId: string | undefined;
 
-  async function runCheck(domain: string, noCache: boolean, crtShFirst: boolean = false) {
+  async function runCheck(domain: string, noCache: boolean, ctSource?: import('../lib/types').CtSourcePref) {
     // Cancel any previous in-flight scan so we don't merge stale events into a new scan.
     cancelStream?.();
     cancelStream = null;
 
-    dns = web = expiry = ct = redirects = seo = reputation = null;
+    dns = web = expiry = ct = redirects = reputation = null;
     scannedDomain = domain;
     groupErrors = {};
     failedGroups = [];
@@ -242,16 +262,16 @@
     historyMode = false;
     loading = true;
 
+    // We intentionally do NOT touch the URL during a scan. That keeps a page
+    // refresh on the root checker showing the (empty) root page instead of
+    // trying to restore a half-scanned state, while history/other views keep
+    // their own URLs. scanId is still needed for the authenticated finalize call.
     const scanId = user ? crypto.randomUUID() : undefined;
-    if (scanId) {
-      window.location.hash = `#/?domain=${encodeURIComponent(domain)}&scanId=${scanId}`;
-    } else {
-      window.location.hash = `#/?domain=${encodeURIComponent(domain)}`;
-    }
+    activeScanId = scanId;
 
     cancelStream = runScanStream(
       domain,
-      { noCache, crtShFirst, scanId },
+      { noCache, ctSource, scanId },
       {
         onSection: (section, data, ageMs) => {
           applySection(section, data);
@@ -271,7 +291,7 @@
           cancelStream = null;
 
           // Instant client-side score for unauth'd users.
-          const score = calculateClientScore(dns, web, expiry, redirects, reputation);
+          const score = calculateClientScore(dns, web, expiry, redirects, reputation, ct);
           if (score) scoreData = score;
 
           // Authenticated: ask server to finalize (persists score + diff vs previous scan).
@@ -311,8 +331,8 @@
     cancelStream?.();
   });
 
-  function handleCheck(e: CustomEvent<{ domain: string; noCache: boolean; crtShFirst: boolean }>) {
-    runCheck(e.detail.domain, e.detail.noCache, e.detail.crtShFirst);
+  function handleCheck(e: CustomEvent<{ domain: string; noCache: boolean; ctSource?: import('../lib/types').CtSourcePref }>) {
+    runCheck(e.detail.domain, e.detail.noCache, e.detail.ctSource);
   }
 
   let exportingFormat: 'html' | 'pdf' | null = null;
@@ -333,11 +353,11 @@
   }
 
   function buildExportPayload(): ReportPayload {
-    // scanId lives in the URL hash for both live (authenticated) and history
-    // views. Anonymous scans don't have one; the footer falls back to a plain
-    // timestamp in that case.
+    // Live (authenticated) scans track their id in `activeScanId`; history views
+    // carry it in the URL hash. Anonymous scans have none — the footer falls
+    // back to a plain timestamp in that case.
     const hashParams = new URLSearchParams(window.location.hash.replace(/^#\/?\??/, ''));
-    const scanId = hashParams.get('scanId');
+    const scanId = activeScanId || hashParams.get('scanId');
 
     return {
       domain: scannedDomain,
@@ -350,7 +370,6 @@
       expiry,
       ct,
       redirects,
-      seo,
       reputation,
     };
   }
@@ -374,9 +393,7 @@
   }
 
   async function refreshCt() {
-    const hash = window.location.hash;
-    const params = new URLSearchParams(hash.replace(/^#\/?\??/, ''));
-    const domain = params.get('domain');
+    const domain = scannedDomain;
     if (!domain) return;
     try {
       const res = await fetch(
@@ -630,18 +647,6 @@
           dmarc={dns?.dmarc || { status: 'info', record: null, validations: [], tags: [], error: loading ? 'Loading…' : 'Check failed' }}
           dkim={dns?.dkim || { status: 'info', foundCount: 0, totalChecked: 0, selectors: [] }}
           mx={dns?.mx || { status: 'info', records: [] }} />
-      {/if}
-
-      {#if seo}
-        <SeoCard data={seo} />
-      {:else if groupErrors.seo}
-        <div class="error-card">
-          <span class="error-card-icon">✗</span>
-          <div>
-            <span class="error-card-title">{GROUP_LABELS.seo}</span>
-            <p class="error-card-detail">{groupErrors.seo}</p>
-          </div>
-        </div>
       {/if}
 
     </div>

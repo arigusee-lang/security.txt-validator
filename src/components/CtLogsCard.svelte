@@ -22,6 +22,15 @@
     return new Date(d).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
   }
 
+  // Date + HH:MM so multiple genuinely distinct certs issued the same day (same
+  // CN/CA, different issuance time) are visually distinguishable instead of
+  // looking like duplicate rows.
+  function formatDateTime(d: string): string {
+    if (!d) return '—';
+    const dt = new Date(d);
+    return `${dt.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}, ${dt.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })}`;
+  }
+
   function handleRefresh() {
     refreshing = true;
     dispatch('refresh');
@@ -98,6 +107,9 @@
     {/if}
 
     <p class="summary">{data.totalCerts} certificate{data.totalCerts !== 1 ? 's' : ''} found in CT logs{data.recentCerts.length < data.totalCerts ? ` (showing ${data.recentCerts.length} unique recent)` : ''}</p>
+    <p class="scope-note" title="This is a point-in-time scan: it shows certificates that are currently valid plus any that expired within the last 30 days. Older history is out of scope here.">
+      Scope: valid + expired ≤30 days
+    </p>
 
     <!-- Flagged Certs Table -->
     {#if data.flaggedCerts && data.flaggedCerts.length > 0}
@@ -110,7 +122,7 @@
               <tr>
                 <td class="cn">{cert.commonName}</td>
                 <td>{cert.issuerName}</td>
-                <td>{formatDate(cert.notBefore)}</td>
+                <td title={cert.notBefore}>{formatDateTime(cert.notBefore)}</td>
                 <td>{formatDate(cert.notAfter)}</td>
               </tr>
             {/each}
@@ -135,7 +147,7 @@
               <tr>
                 <td class="cn">{cert.commonName}</td>
                 <td>{cert.issuerName}</td>
-                <td>{formatDate(cert.notBefore)}</td>
+                <td title={cert.notBefore}>{formatDateTime(cert.notBefore)}</td>
                 <td>{formatDate(cert.notAfter)}</td>
               </tr>
             {/each}
@@ -189,7 +201,8 @@
 <style>
   .error-text { color: var(--color-error); font-size: 0.85rem; }
   .error-row { display: flex; align-items: center; gap: 0.5rem; }
-  .summary { font-size: 0.85rem; color: var(--color-text-secondary); margin-bottom: 0.5rem; }
+  .summary { font-size: 0.85rem; color: var(--color-text-secondary); margin-bottom: 0.15rem; }
+  .scope-note { font-size: 0.72rem; color: var(--color-text-secondary); opacity: 0.65; margin: 0 0 0.5rem; cursor: help; }
   .no-findings { font-size: 0.8rem; color: var(--color-text-secondary); opacity: 0.7; margin-bottom: 0.5rem; }
   .findings { display: flex; flex-direction: column; gap: 0.35rem; margin-bottom: 0.6rem; }
   .finding-row { display: flex; align-items: flex-start; gap: 0.4rem; font-size: 0.8rem; }

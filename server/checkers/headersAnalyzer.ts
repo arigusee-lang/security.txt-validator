@@ -59,7 +59,10 @@ export function analyzeHeaders(headers: Record<string, string>): HeadersResult {
   const pp = headers["permissions-policy"];
   items.push(pp
     ? { name: "Permissions-Policy", present: true, value: pp.length > 80 ? pp.slice(0, 80) + "…" : pp, status: "pass", explanation: "Browser feature permissions restricted", ref: REFS["Permissions-Policy"] }
-    : { name: "Permissions-Policy", present: false, value: "missing", status: "warn", explanation: "Missing — browser features not explicitly restricted", ref: REFS["Permissions-Policy"] }
+    // Missing → info, not warn. For typical sites (not embedded as iframe,
+    // no use of camera/mic/geo), this header has little real impact — it's a
+    // nice-to-have hardening, not a security gap.
+    : { name: "Permissions-Policy", present: false, value: "missing", status: "info", explanation: "Missing — browser features not explicitly restricted (low impact for most sites)", ref: REFS["Permissions-Policy"] }
   );
 
   const xxss = headers["x-xss-protection"];

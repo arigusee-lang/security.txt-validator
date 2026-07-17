@@ -364,7 +364,6 @@ export interface DomainCheckResponse {
   blacklist: BlacklistResult;
   ctLogs: CtLogsResult;
   redirects: RedirectResult;
-  seo: SeoResult;
   safeBrowsing: SafeBrowsingResult;
   urlhaus: UrlhausResult;
   danglingDns: DanglingDnsResult;
@@ -387,7 +386,14 @@ export interface CtFinding {
   subdomain?: string;
 }
 
-export type CtDataSource = "crt.sh" | "certspotter" | "none";
+export type CtDataSource = "crt.sh-pg" | "certspotter" | "none";
+
+/**
+ * Admin-selectable preferred CT data source. When set, the chosen source is
+ * tried first and the other acts as fallback; when undefined, the default
+ * order applies (crt.sh-pg → certspotter).
+ */
+export type CtSourcePref = "certspotter" | "crt.sh-pg";
 
 export interface CtLogsResult {
   status: CheckStatus;
@@ -410,7 +416,8 @@ export interface CtCheckOptions {
   authenticated?: boolean;
   sslIssuer?: string | null;
   caaRecords?: CaaRecord[];
-  crtShFirst?: boolean;
+  /** Preferred CT source; undefined = default chain order. */
+  ctSource?: CtSourcePref;
   timeout?: number;
   startAfterId?: string;
 }
@@ -432,20 +439,6 @@ export interface RedirectResult {
   error?: string;
 }
 
-// ── SEO ──
-
-export interface SeoCheckItem {
-  check: string;
-  status: CheckStatus;
-  detail: string;
-  ref?: string;
-}
-
-export interface SeoResult {
-  status: CheckStatus;
-  items: SeoCheckItem[];
-  error?: string;
-}
 
 // ── Google Safe Browsing ──
 
@@ -624,12 +617,12 @@ export interface ScanConfig {
     blacklist: boolean;
     ctLogs: boolean;
     redirects: boolean;
-    seo: boolean;
     reputation: boolean;
     danglingDns: boolean;
   };
   noCache: boolean;
-  crtShFirst?: boolean;
+  /** Preferred CT source; undefined = default chain order. */
+  ctSource?: CtSourcePref;
   authenticated?: boolean;
 }
 
@@ -638,7 +631,7 @@ export const DEFAULT_SCAN_CONFIG: ScanConfig = {
     securityTxt: true, headers: true, spf: true, dmarc: true,
     dkim: true, dnssec: true, caa: true, mx: true, ns: true,
     ssl: true, domainExpiry: true, blacklist: true, ctLogs: true,
-    redirects: true, seo: false, reputation: true, danglingDns: true,
+    redirects: true, reputation: true, danglingDns: true,
   },
   noCache: false,
 };

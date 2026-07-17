@@ -1,12 +1,17 @@
-name: Deploy to GCE VM
+name: Deploy to VM
 
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+
+# Never let two deploys run at once; queue them instead of racing on the VM.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
 
 env:
   VM_USER: dn-sec
-  VM_HOST: ${{ secrets.VM_HOST }}
   APP_DIR: /opt/dn-sec
 
 jobs:
@@ -19,6 +24,8 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci --legacy-peer-deps
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: "true"
       - run: npm test
       - run: npm run build
 
@@ -26,38 +33,70 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
       - name: Setup SSH
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H ${{ secrets.VM_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+          ssh-keyscan -H "$VM_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
-      - name: Deploy to VM
+      # Materialize the production env file from a single GitHub secret.
+      # umask 077 so the temp file is never group/world-readable on the runner.
+      - name: Write production env file
+        env:
+          PROD_ENV: ${{ secrets.PROD_ENV }}
         run: |
-          ssh -i ~/.ssh/deploy_key $VM_USER@$VM_HOST << 'DEPLOY'
-            set -e
-            cd ${{ env.APP_DIR }}
+          umask 077
+          printf '%s' "$PROD_ENV" > prod.env
+          test -s prod.env || { echo "PROD_ENV secret is empty"; exit 1; }
 
-            # Pull latest code
+      - name: Upload env and deploy
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+        run: |
+          # Ship secrets first, then pull code, build, and restart.
+          scp -i ~/.ssh/deploy_key prod.env "$VM_USER@$VM_HOST:$APP_DIR/.env"
+          ssh -i ~/.ssh/deploy_key "$VM_USER@$VM_HOST" bash <<'DEPLOY'
+            set -euo pipefail
+            cd /opt/dn-sec
+
+            chmod 600 .env
+
             git fetch origin main
             git reset --hard origin/main
 
-            # Install dependencies and build
-            npm ci --legacy-peer-deps
+            # PDF export is disabled on this box — skip the ~150 MB Chromium
+            # download that puppeteer would otherwise fetch (and OOM the e2-micro).
+            PUPPETEER_SKIP_DOWNLOAD=true npm ci --legacy-peer-deps
             npm run build
 
-            # Restart the service
-            sudo systemctl restart dn-sec
+            # If the systemd unit itself changed, reinstall it before restarting.
+            # Absolute paths so the narrow NOPASSWD sudoers rule matches exactly.
+            if ! cmp -s deploy/dn-sec.service /etc/systemd/system/dn-sec.service; then
+              sudo /usr/bin/cp /opt/dn-sec/deploy/dn-sec.service /etc/systemd/system/dn-sec.service
+              sudo /usr/bin/systemctl daemon-reload
+            fi
 
-            echo "Deploy complete. Checking service status..."
+            sudo /usr/bin/systemctl restart dn-sec
             sleep 2
-            sudo systemctl is-active dn-sec
+            sudo /usr/bin/systemctl is-active dn-sec
           DEPLOY
+
+      - name: Remove local secret
+        if: always()
+        run: rm -f prod.env
 
       - name: Health check
         run: |
-          sleep 5
-          curl -sf https://dn-sec.com/ > /dev/null && echo "Health check passed" || echo "Health check failed"
+          for i in 1 2 3 4 5; do
+            if curl -sf https://dn-sec.com/ > /dev/null; then
+              echo "Health check passed"
+              exit 0
+            fi
+            echo "Attempt $i failed; retrying in 5s..."
+            sleep 5
+          done
+          echo "Health check failed after 5 attempts"
+          exit 1

@@ -102,7 +102,6 @@ export interface ReportPayload {
   expiry: any;
   ct: any;
   redirects: any;
-  seo: any;
   reputation: any;
 }
 

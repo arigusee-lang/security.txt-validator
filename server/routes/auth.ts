@@ -90,9 +90,18 @@ export function createAuthRoutes({ lucia, google, github, db }: AuthDeps): Route
       const googleUser = (await userResponse.json()) as {
         sub: string;
         email: string;
+        email_verified?: boolean;
         name?: string;
         picture?: string;
       };
+
+      if (!googleUser.email || googleUser.email_verified !== true) {
+        googleLog.error(
+          { sub: googleUser.sub, hasEmail: !!googleUser.email, verified: googleUser.email_verified },
+          "email not verified"
+        );
+        return res.redirect(frontendRedirect("/?auth_error=email_unverified"));
+      }
 
       const user = upsertUser(db, {
         provider: "google",
@@ -177,29 +186,31 @@ export function createAuthRoutes({ lucia, google, github, db }: AuthDeps): Route
         login: string;
         name?: string;
         avatar_url?: string;
-        email?: string;
       };
 
-      // Get primary email if not in profile
-      let email = githubUser.email;
-      if (!email) {
-        const emailsResponse = await fetch("https://api.github.com/user/emails", {
-          headers: { Authorization: `Bearer ${accessToken}` },
-        });
-        if (emailsResponse.ok) {
-          const emails = (await emailsResponse.json()) as Array<{
-            email: string;
-            primary: boolean;
-            verified: boolean;
-          }>;
-          const primary = emails.find((e) => e.primary && e.verified);
-          email = primary?.email ?? emails[0]?.email ?? null;
-        }
+      // Always resolve email from the verified emails list — the profile email
+      // is not guaranteed to be verified, and email is used to link accounts.
+      const emailsResponse = await fetch("https://api.github.com/user/emails", {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      if (!emailsResponse.ok) {
+        githubLog.error({ status: emailsResponse.status, login: githubUser.login }, "emails fetch failed");
+        return res.redirect(frontendRedirect("/?auth_error=1"));
       }
+      const emails = (await emailsResponse.json()) as Array<{
+        email: string;
+        primary: boolean;
+        verified: boolean;
+      }>;
+      // Prefer the primary verified email, then any verified email.
+      const email =
+        emails.find((e) => e.primary && e.verified)?.email ??
+        emails.find((e) => e.verified)?.email ??
+        null;
 
       if (!email) {
-        githubLog.error({ login: githubUser.login }, "no email found for user");
-        return res.redirect(frontendRedirect("/?auth_error=1"));
+        githubLog.error({ login: githubUser.login }, "no verified email found for user");
+        return res.redirect(frontendRedirect("/?auth_error=email_unverified"));
       }
 
       const user = upsertUser(db, {

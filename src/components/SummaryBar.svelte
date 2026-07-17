@@ -26,6 +26,11 @@
   $: overallLabel = overallStatus === 'pass' ? 'All checks passed'
     : overallStatus === 'fail' ? `${failCount} issue${failCount !== 1 ? 's' : ''} found`
     : `${warnCount} warning${warnCount !== 1 ? 's' : ''}`;
+
+  // Surface which cards triggered the warn/fail so the user can jump straight
+  // to them instead of scanning the page top-to-bottom.
+  $: failedLabels = checks.filter(c => c.status === 'fail').map(c => c.label);
+  $: warnLabels = checks.filter(c => c.status === 'warn').map(c => c.label);
 </script>
 
 <div class="summary-bar {overallClass}" role="status">
@@ -48,6 +53,18 @@
     {#if warnCount > 0}<div class="seg warn-seg" style="width: {warnCount / total * 100}%"></div>{/if}
     {#if failCount > 0}<div class="seg fail-seg" style="width: {failCount / total * 100}%"></div>{/if}
   </div>
+  {#if failedLabels.length > 0 || warnLabels.length > 0}
+    <div class="trouble-list">
+      {#if failedLabels.length > 0}
+        <span class="trouble-label fail-count">Failed:</span>
+        <span>{failedLabels.join(', ')}</span>
+      {/if}
+      {#if warnLabels.length > 0}
+        <span class="trouble-label warn-count">Warnings:</span>
+        <span>{warnLabels.join(', ')}</span>
+      {/if}
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -144,4 +161,17 @@
   .warn-seg { background: var(--color-warning); }
   .fail-seg { background: var(--color-error); }
   .info-seg { background: var(--color-border); }
+
+  .trouble-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem 0.75rem;
+    margin-top: 0.5rem;
+    font-size: 0.72rem;
+    color: var(--color-text-secondary);
+  }
+  .trouble-label {
+    font-weight: 600;
+    margin-right: 0.25rem;
+  }
 </style>

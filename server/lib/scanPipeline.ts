@@ -10,12 +10,13 @@
  *  - Wave 0: infrastructure (resolve + CDN detect). Needed by blacklist,
  *    multi-edge TLS probe, and CDN-managed cert detection.
  *  - Wave 1: everything else with no cross-group dependency (DNS records,
- *    primary fetch + cert, redirects, seo, safeBrowsing, urlhaus, edges probe).
+ *    primary fetch + cert, redirects, safeBrowsing, urlhaus, edges probe).
  *  - Wave 2: CT logs (needs ssl.issuer + caa.records).
  */
 
 import { cacheGetWithAge, cacheSet } from "./cache.js";
 import { createLogger } from "./logger.js";
+import { incr, observe } from "./metrics.js";
 import { checkSpf } from "../checkers/spfChecker.js";
 import { checkDmarc } from "../checkers/dmarcChecker.js";
 import { checkDkim } from "../checkers/dkimChecker.js";
@@ -32,15 +33,15 @@ import { analyzeHeaders } from "../checkers/headersAnalyzer.js";
 import { analyzeSsl, analyzeSslDeep, applyManagedCertPolicy } from "../checkers/sslChecker.js";
 import { probeMultiEdge } from "./tlsEdgeProbe.js";
 import { checkRedirects } from "../checkers/redirectChecker.js";
-import { checkSeo } from "../checkers/seoChecker.js";
 import { checkSafeBrowsing } from "../checkers/safeBrowsingChecker.js";
 import { checkUrlhaus } from "../checkers/urlhausChecker.js";
-import { checkCtLogs } from "../checkers/ctLogsChecker.js";
+import { checkCtLogs, ctSourceTag } from "../checkers/ctLogsChecker.js";
 import { parse } from "../../src/lib/parser.js";
 import { validate } from "../../src/lib/validator.js";
 import type {
-  ScanChecks,
+  ScanConfig,
   CtCheckOptions,
+  CtSourcePref,
   SslResult,
   CaaResult,
   InfrastructureResult,
@@ -69,7 +70,6 @@ export type ScanSection =
   | "headers"
   | "ssl"
   | "redirects"
-  | "seo"
   | "safeBrowsing"
   | "urlhaus"
   | "ctLogs";
@@ -83,9 +83,9 @@ export type OnProgress = (event: ProgressEvent) => void;
 
 export interface ScanOptions {
   noCache: boolean;
-  checks: ScanChecks;
+  checks: ScanConfig["checks"];
   premiumPlus?: boolean;
-  crtShFirst?: boolean;
+  ctSource?: CtSourcePref;
 }
 
 /** Run a cached check, returning data + age. Age is null on cache miss. */
@@ -120,6 +120,7 @@ async function runAndEmit<T>(
   } catch (err: any) {
     const message = err?.message || String(err);
     log.warn({ section, err: message }, "check failed");
+    incr("check_error", { section });
     onProgress({ type: "section-error", section, message });
     onProgress({ type: "section", section, data: fallback, cacheAgeMs: null });
     return fallback;
@@ -133,6 +134,9 @@ export async function runDomainScan(
   signal?: AbortSignal,
 ): Promise<void> {
   const { noCache, checks } = opts;
+  const startedAt = Date.now();
+  let outcome = "ok";
+  try {
 
   // ─── Wave 0: infrastructure ──────────────────────────────────────────
   let infrastructure: InfrastructureResult | null = null;
@@ -144,7 +148,7 @@ export async function runDomainScan(
       { ip: null, ips: [], resolverCount: 0, cdnProvider: null, cdnProviders: [], error: "Check failed" },
     );
   }
-  if (signal?.aborted) return;
+  if (signal?.aborted) { outcome = "aborted"; return; }
 
   // ─── Wave 1: parallel checks ─────────────────────────────────────────
   const wave1: Promise<any>[] = [];
@@ -300,6 +304,7 @@ export async function runDomainScan(
           }
           onProgress({ type: "section", section: "securityTxt", data: securityTxt, cacheAgeMs });
         } catch (err: any) {
+          incr("check_error", { section: "securityTxt" });
           onProgress({ type: "section-error", section: "securityTxt", message: err?.message || String(err) });
         }
       })(),
@@ -317,6 +322,7 @@ export async function runDomainScan(
             : { status: "info" as const, items: [] };
           onProgress({ type: "section", section: "headers", data: headers, cacheAgeMs });
         } catch (err: any) {
+          incr("check_error", { section: "headers" });
           onProgress({ type: "section-error", section: "headers", message: err?.message || String(err) });
         }
       })(),
@@ -356,6 +362,7 @@ export async function runDomainScan(
         onProgress({ type: "section", section: "ssl", data: ssl, cacheAgeMs });
         return ssl;
       } catch (err: any) {
+        incr("check_error", { section: "ssl" });
         onProgress({ type: "section-error", section: "ssl", message: err?.message || String(err) });
         return null;
       }
@@ -370,17 +377,6 @@ export async function runDomainScan(
         cached(`redir:${domain}`, noCache, () => checkRedirects(domain, HTTP_TIMEOUT)),
         onProgress,
         { status: "info", httpsRedirect: false, wwwBehavior: null, items: [], error: "Check failed" },
-      ),
-    );
-  }
-
-  if (checks.seo) {
-    wave1.push(
-      runAndEmit(
-        "seo",
-        cached(`seo:${domain}`, noCache, () => checkSeo(domain, HTTP_TIMEOUT)),
-        onProgress,
-        { status: "info", items: [], error: "Check failed" },
       ),
     );
   }
@@ -405,7 +401,7 @@ export async function runDomainScan(
   }
 
   await Promise.allSettled(wave1);
-  if (signal?.aborted) return;
+  if (signal?.aborted) { outcome = "aborted"; return; }
 
   // ─── Wave 2: CT logs needs ssl.issuer + caa.records ──────────────────
   if (checks.ctLogs) {
@@ -415,9 +411,9 @@ export async function runDomainScan(
       authenticated: !!opts.premiumPlus,
       sslIssuer: ssl?.issuer ?? null,
       caaRecords: caa?.records ?? [],
-      crtShFirst: opts.crtShFirst ?? false,
+      ctSource: opts.ctSource,
     };
-    const cacheKey = `ct:${domain}:${opts.crtShFirst ? "crt" : "cs"}:${opts.premiumPlus ? "s1" : "s0"}`;
+    const cacheKey = `ct:${domain}:${ctSourceTag(opts.ctSource)}:${opts.premiumPlus ? "s1" : "s0"}`;
     await runAndEmit(
       "ctLogs",
       cached(cacheKey, noCache, () => checkCtLogs(domain, ctOpts)),
@@ -427,4 +423,11 @@ export async function runDomainScan(
   }
 
   onProgress({ type: "done" });
+  } catch (err) {
+    outcome = "error";
+    throw err;
+  } finally {
+    incr("scan", { outcome });
+    observe("scan_duration_ms", Date.now() - startedAt, { outcome });
+  }
 }

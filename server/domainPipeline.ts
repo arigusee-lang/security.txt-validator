@@ -22,9 +22,8 @@ import { probeMultiEdge } from "./lib/tlsEdgeProbe.js";
 import { checkDomainExpiry } from "./checkers/domainExpiryChecker.js";
 import { checkBlacklist } from "./checkers/blacklistChecker.js";
 import { checkInfrastructure } from "./checkers/infrastructureChecker.js";
-import { checkCtLogs } from "./checkers/ctLogsChecker.js";
+import { checkCtLogs, ctSourceTag } from "./checkers/ctLogsChecker.js";
 import { checkRedirects } from "./checkers/redirectChecker.js";
-import { checkSeo } from "./checkers/seoChecker.js";
 import { checkSafeBrowsing } from "./checkers/safeBrowsingChecker.js";
 import { checkUrlhaus } from "./checkers/urlhausChecker.js";
 import { checkDanglingDns } from "./checkers/danglingDnsChecker.js";
@@ -279,31 +278,29 @@ export async function runDomainCheck(
     authenticated: wantSubdomains,
     sslIssuer: ssl?.issuer ?? null,
     caaRecords: caa?.records ?? [],
-    crtShFirst: config.crtShFirst ?? false,
+    ctSource: config.ctSource,
   };
 
   const extraPromises = await Promise.allSettled([
     checks.domainExpiry ? timed(timings, "domainExpiry", () => cached(`exp:${domain}`, nc, () => checkDomainExpiry(domain, HTTP_TIMEOUT))) : Promise.resolve(null),
-    checks.ctLogs ? timed(timings, "ctLogs", () => cached(`ct:${domain}:${wantSubdomains ? "s1" : "s0"}`, nc, () => checkCtLogs(domain, ctOpts))) : Promise.resolve(null),
+    checks.ctLogs ? timed(timings, "ctLogs", () => cached(`ct:${domain}:${ctSourceTag(config.ctSource)}:${wantSubdomains ? "s1" : "s0"}`, nc, () => checkCtLogs(domain, ctOpts))) : Promise.resolve(null),
     checks.redirects ? timed(timings, "redirects", () => cached(`redir:${domain}`, nc, () => checkRedirects(domain, HTTP_TIMEOUT))) : Promise.resolve(null),
-    checks.seo ? timed(timings, "seo", () => cached(`seo:${domain}`, nc, () => checkSeo(domain, HTTP_TIMEOUT))) : Promise.resolve(null),
     checks.reputation ? timed(timings, "safeBrowsing", () => cached(`sb:${domain}`, nc, () => checkSafeBrowsing(domain, DNS_TIMEOUT))) : Promise.resolve(null),
     checks.reputation ? timed(timings, "urlhaus", () => cached(`uh:${domain}`, nc, () => checkUrlhaus(domain, DNS_TIMEOUT))) : Promise.resolve(null),
   ]);
 
-  const [domainExpiryR, ctLogsR, redirectsR, seoR, safeBrowsingR, urlhausR] = extraPromises;
+  const [domainExpiryR, ctLogsR, redirectsR, safeBrowsingR, urlhausR] = extraPromises;
 
   const domainExpiry = settled(domainExpiryR, null) ?? { status: "info" as const, expirationDate: null, daysRemaining: null, error: "Check failed" };
   const ctLogs = settled(ctLogsR, null) ?? { status: "info" as const, totalCerts: 0, recentCerts: [], error: "Check failed" };
   const redirects = settled(redirectsR, null) ?? { status: "info" as const, httpsRedirect: false, wwwBehavior: null, items: [], error: "Check failed" };
-  const seo = settled(seoR, null) ?? { status: "info" as const, items: [], error: "Check failed" };
   const safeBrowsing = settled(safeBrowsingR, null) ?? { status: "info" as const, safe: null, threats: [], error: "Check failed" };
   const urlhaus = settled(urlhausR, null) ?? { status: "info" as const, listed: false, urlCount: 0, error: "Check failed" };
 
   const checkerResults: Record<string, { status?: string }> = {
     spf, dmarc, dkim, dnssec, caa, mx, ns, blacklist, danglingDns,
     securityTxt, headers, ssl,
-    domainExpiry, ctLogs, redirects, seo, safeBrowsing, urlhaus,
+    domainExpiry, ctLogs, redirects, safeBrowsing, urlhaus,
   };
   const summary = { pass: 0, warn: 0, fail: 0, info: 0 };
   const checkers: Record<string, { status: string; durationMs: number | null }> = {};
@@ -343,7 +340,6 @@ export async function runDomainCheck(
     blacklist,
     ctLogs,
     redirects,
-    seo,
     safeBrowsing,
     urlhaus,
     danglingDns,

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { currentUser, authLoading } from '../lib/authStore';
   import HistoryTab from './HistoryTab.svelte';
   import BatchScansTab from './BatchScansTab.svelte';
@@ -39,6 +39,14 @@
     if (!v && !user) {
       window.location.hash = '#/';
     }
+  });
+
+  function syncTabFromHash() {
+    activeTab = getTabFromHash();
+  }
+  onMount(() => {
+    window.addEventListener('hashchange', syncTabFromHash);
+    return () => window.removeEventListener('hashchange', syncTabFromHash);
   });
   onDestroy(() => { unsubUser(); unsubLoading(); });
 

@@ -24,7 +24,6 @@ export type ScanSection =
   | "headers"
   | "ssl"
   | "redirects"
-  | "seo"
   | "safeBrowsing"
   | "urlhaus"
   | "ctLogs";
@@ -38,7 +37,7 @@ export interface ScanStreamHandlers {
 
 export interface ScanStreamOptions {
   noCache?: boolean;
-  crtShFirst?: boolean;
+  ctSource?: import("./types").CtSourcePref;
   scanId?: string;
 }
 
@@ -54,7 +53,7 @@ export function runScanStream(
   const params = new URLSearchParams();
   params.set("domain", domain);
   if (opts.noCache) params.set("noCache", "1");
-  if (opts.crtShFirst) params.set("crtShFirst", "1");
+  if (opts.ctSource) params.set("ctSource", opts.ctSource);
   if (opts.scanId) params.set("scanId", opts.scanId);
 
   const url = `/api/domain-check/stream?${params.toString()}`;

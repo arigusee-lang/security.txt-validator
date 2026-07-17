@@ -18,9 +18,8 @@ import { probeMultiEdge } from "../lib/tlsEdgeProbe.js";
 import { checkDomainExpiry } from "../checkers/domainExpiryChecker.js";
 import { checkBlacklist } from "../checkers/blacklistChecker.js";
 import { checkInfrastructure } from "../checkers/infrastructureChecker.js";
-import { checkCtLogs } from "../checkers/ctLogsChecker.js";
+import { checkCtLogs, ctSourceTag } from "../checkers/ctLogsChecker.js";
 import { checkRedirects } from "../checkers/redirectChecker.js";
-import { checkSeo } from "../checkers/seoChecker.js";
 import { checkSafeBrowsing } from "../checkers/safeBrowsingChecker.js";
 import { checkUrlhaus } from "../checkers/urlhausChecker.js";
 import { checkDanglingDns } from "../checkers/danglingDnsChecker.js";
@@ -32,7 +31,7 @@ import { validate } from "../../src/lib/validator.js";
 import { calculateScore } from "../scoreCalculator.js";
 import { getRemediation } from "../remediations.js";
 import { computeDiff } from "../diffEngine.js";
-import type { ScanConfig, DomainCheckResponse, CheckStatus, CtCheckOptions } from "../types.js";
+import type { ScanConfig, DomainCheckResponse, CheckStatus, CtCheckOptions, CtSourcePref } from "../types.js";
 import { DEFAULT_SCAN_CONFIG } from "../types.js";
 import { runDomainScan, type ProgressEvent, type ScanSection } from "../lib/scanPipeline.js";
 
@@ -67,7 +66,7 @@ function parseScanConfig(query: Record<string, any>): ScanConfig {
   const config: ScanConfig = JSON.parse(JSON.stringify(DEFAULT_SCAN_CONFIG));
   // noCache from query
   if (query.noCache === "1") config.noCache = true;
-  if (query.crtShFirst === "1") config.crtShFirst = true;
+  if (isCtSourcePref(query.ctSource)) config.ctSource = query.ctSource;
 
   // Parse individual check toggles from query: e.g., ?checks.ssl=0&checks.headers=0
   if (query.config) {
@@ -81,12 +80,17 @@ function parseScanConfig(query: Record<string, any>): ScanConfig {
         }
       }
       if (parsed.noCache !== undefined) config.noCache = !!parsed.noCache;
-      if (parsed.crtShFirst !== undefined) config.crtShFirst = !!parsed.crtShFirst;
+      if (isCtSourcePref(parsed.ctSource)) config.ctSource = parsed.ctSource;
     } catch {
       // Ignore invalid config JSON
     }
   }
   return config;
+}
+
+/** Narrow an untrusted value to a valid CtSourcePref. */
+function isCtSourcePref(v: unknown): v is CtSourcePref {
+  return v === "certspotter" || v === "crt.sh-pg";
 }
 
 /** Attach remediation info to findings with warn/fail status */
@@ -426,9 +430,9 @@ export function createDomainCheckRoutes({ db }: DomainCheckDeps): Router {
     const wantSubdomains = req.user?.plan === "premium_plus";
     const ctOpts: CtCheckOptions = {
       authenticated: wantSubdomains,
-      crtShFirst: config.crtShFirst ?? false,
+      ctSource: config.ctSource,
     };
-    const ctResult = await cached(`ct:${domain}:${config.crtShFirst ? "crt" : "cs"}:${wantSubdomains ? "s1" : "s0"}`, config.noCache, () => checkCtLogs(domain, ctOpts));
+    const ctResult = await cached(`ct:${domain}:${ctSourceTag(config.ctSource)}:${wantSubdomains ? "s1" : "s0"}`, config.noCache, () => checkCtLogs(domain, ctOpts));
 
     const scanId = req.query.scanId as string | undefined;
     if (req.user && scanId && db && ctResult) {
@@ -450,20 +454,6 @@ export function createDomainCheckRoutes({ db }: DomainCheckDeps): Router {
     }
 
     res.json(redirectsResult);
-  });
-
-  router.get("/seo", async (req, res) => {
-    const domain = req.query.domain as string;
-    const config = parseScanConfig(req.query);
-    if (!config.checks.seo) { res.json(null); return; }
-    const seoResult = await cached(`seo:${domain}`, config.noCache, () => checkSeo(domain, HTTP_TIMEOUT));
-
-    const scanId = req.query.scanId as string | undefined;
-    if (req.user && scanId && db && seoResult) {
-      try { saveScanSection(db, scanId, req.user.id, domain, "seo", seoResult); } catch (e) { log.error({ err: e, section: "seo" }, "saveScanSection error"); }
-    }
-
-    res.json(seoResult);
   });
 
   router.get("/reputation", async (req, res) => {
@@ -514,7 +504,6 @@ export function createDomainCheckRoutes({ db }: DomainCheckDeps): Router {
 
     const tasks: Array<{ label: string; promise: Promise<any>; fallback: any }> = [];
     if (checks.redirects) tasks.push({ label: "redirects", promise: cached(`redir:${domain}`, nc, () => checkRedirects(domain, HTTP_TIMEOUT), res), fallback: { status: "info", httpsRedirect: false, wwwBehavior: null, items: [], error: "Check failed" } });
-    if (checks.seo) tasks.push({ label: "seo", promise: cached(`seo:${domain}`, nc, () => checkSeo(domain, HTTP_TIMEOUT), res), fallback: { status: "info", items: [], error: "Check failed" } });
 
     const results = await Promise.allSettled(tasks.map(t => t.promise));
     tasks.forEach((t, i) => {
@@ -552,11 +541,11 @@ export function createDomainCheckRoutes({ db }: DomainCheckDeps): Router {
       const wantSubdomains = req.user?.plan === "premium_plus";
       const ctOpts: CtCheckOptions = {
         authenticated: wantSubdomains,
-        crtShFirst: config.crtShFirst ?? false,
+        ctSource: config.ctSource,
         caaRecords,
         sslIssuer: cachedSsl?.tlsCert?.issuer ?? null,
       };
-      tasks.push({ label: "ct", promise: cached(`ct:${domain}:${config.crtShFirst ? "crt" : "cs"}:${wantSubdomains ? "s1" : "s0"}`, nc, () => checkCtLogs(domain, ctOpts), res), fallback: { status: "info", totalCerts: 0, recentCerts: [], findings: [], source: "none", error: "Check failed" } });
+      tasks.push({ label: "ct", promise: cached(`ct:${domain}:${ctSourceTag(config.ctSource)}:${wantSubdomains ? "s1" : "s0"}`, nc, () => checkCtLogs(domain, ctOpts), res), fallback: { status: "info", totalCerts: 0, recentCerts: [], findings: [], source: "none", error: "Check failed" } });
     }
     if (checks.reputation) {
       tasks.push({ label: "safeBrowsing", promise: cached(`sb:${domain}`, nc, () => checkSafeBrowsing(domain, DNS_TIMEOUT), res), fallback: { status: "info", safe: null, threats: [], error: "Check failed" } });
@@ -637,7 +626,7 @@ export function createDomainCheckRoutes({ db }: DomainCheckDeps): Router {
           noCache: config.noCache,
           checks: config.checks,
           premiumPlus: req.user?.plan === "premium_plus",
-          crtShFirst: config.crtShFirst ?? false,
+          ctSource: config.ctSource,
         },
         sendEvent,
         aborter.signal,
@@ -767,7 +756,6 @@ export function createDomainCheckRoutes({ db }: DomainCheckDeps): Router {
       const otherPromises: Array<{ label: string; promise: Promise<any>; fallback: any }> = [];
       if (checks.domainExpiry) otherPromises.push({ label: "domainExpiry", promise: cached(`exp:${domain}`, nc, () => checkDomainExpiry(domain, HTTP_TIMEOUT)), fallback: { status: "info", expirationDate: null, daysRemaining: null, error: "Check failed" } });
       if (checks.redirects) otherPromises.push({ label: "redirects", promise: cached(`redir:${domain}`, nc, () => checkRedirects(domain, HTTP_TIMEOUT)), fallback: { status: "info", httpsRedirect: false, wwwBehavior: null, items: [], error: "Check failed" } });
-      if (checks.seo) otherPromises.push({ label: "seo", promise: cached(`seo:${domain}`, nc, () => checkSeo(domain, HTTP_TIMEOUT)), fallback: { status: "info", items: [], error: "Check failed" } });
       if (checks.reputation) {
         otherPromises.push({ label: "safeBrowsing", promise: cached(`sb:${domain}`, nc, () => checkSafeBrowsing(domain, DNS_TIMEOUT)), fallback: { status: "info", safe: null, threats: [], error: "Check failed" } });
         otherPromises.push({ label: "urlhaus", promise: cached(`uh:${domain}`, nc, () => checkUrlhaus(domain, DNS_TIMEOUT)), fallback: { status: "info", listed: false, urlCount: 0, error: "Check failed" } });
@@ -848,10 +836,10 @@ export function createDomainCheckRoutes({ db }: DomainCheckDeps): Router {
           authenticated: wantSubdomains,
           sslIssuer: result.ssl?.issuer ?? null,
           caaRecords: result.caa?.records ?? [],
-          crtShFirst: config.crtShFirst ?? false,
+          ctSource: config.ctSource,
         };
         try {
-          result.ctLogs = await cached(`ct:${domain}:${config.crtShFirst ? "crt" : "cs"}:${wantSubdomains ? "s1" : "s0"}`, nc, () => checkCtLogs(domain, fullCtOpts));
+          result.ctLogs = await cached(`ct:${domain}:${ctSourceTag(config.ctSource)}:${wantSubdomains ? "s1" : "s0"}`, nc, () => checkCtLogs(domain, fullCtOpts));
         } catch {
           result.ctLogs = { status: "info", totalCerts: 0, recentCerts: [], findings: [], source: "none", error: "Check failed" };
         }
@@ -1029,7 +1017,6 @@ export function createDomainCheckRoutes({ db }: DomainCheckDeps): Router {
       // New grouped sections
       if (resultJson.http) {
         if (resultJson.http.redirects) flat.redirects = resultJson.http.redirects;
-        if (resultJson.http.seo) flat.seo = resultJson.http.seo;
       }
       if (resultJson.external) {
         if (resultJson.external.ct) flat.ctLogs = resultJson.external.ct;
@@ -1039,7 +1026,6 @@ export function createDomainCheckRoutes({ db }: DomainCheckDeps): Router {
       // Legacy: old scans may have these as separate sections
       if (resultJson.ct) flat.ctLogs = resultJson.ct;
       if (resultJson.redirects) flat.redirects = resultJson.redirects;
-      if (resultJson.seo) flat.seo = resultJson.seo;
       if (resultJson.reputation) Object.assign(flat, resultJson.reputation);
 
       // Top-level flat format from the SSE pipeline — each check saved under
@@ -1049,7 +1035,7 @@ export function createDomainCheckRoutes({ db }: DomainCheckDeps): Router {
         "spf", "dmarc", "dkim", "dnssec", "caa", "mx", "ns",
         "blacklist", "danglingDns", "infrastructure",
         "securityTxt", "headers", "ssl",
-        "redirects", "seo",
+        "redirects",
         "safeBrowsing", "urlhaus", "ctLogs",
         "domainExpiry",
       ];
@@ -1086,7 +1072,6 @@ export function createDomainCheckRoutes({ db }: DomainCheckDeps): Router {
           if (previousResult.ct) { prevFlat.ctLogs = previousResult.ct; }
           else if (previousResult.ctLogs) { prevFlat.ctLogs = previousResult.ctLogs; }
           if (previousResult.redirects) { prevFlat.redirects = previousResult.redirects; }
-          if (previousResult.seo) { prevFlat.seo = previousResult.seo; }
           if (previousResult.reputation) { Object.assign(prevFlat, previousResult.reputation); }
           else if (previousResult.safeBrowsing) { prevFlat.safeBrowsing = previousResult.safeBrowsing; prevFlat.urlhaus = previousResult.urlhaus; }
 

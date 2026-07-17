@@ -1,12 +1,7 @@
-import { config as loadEnv } from "dotenv";
+// MUST be first: loads .env before any env-reading module is evaluated.
+import "./loadEnv.js";
+
 import path from "node:path";
-
-// Load env file: .env.local for dev, .env.production for prod
-const envFile = process.env.NODE_ENV === "production" ? ".env.production" : ".env.local";
-loadEnv({ path: path.resolve(process.cwd(), envFile) });
-// Fallback: also try .env
-loadEnv();
-
 import express from "express";
 import cors from "cors";
 import compression from "compression";
@@ -31,7 +26,9 @@ import { createMonitoringRoutes } from "./routes/monitoring.js";
 import { createExportRoutes } from "./routes/export.js";
 import { createVerifyRoutes } from "./routes/verify.js";
 import { ctLogsReady } from "./checkers/knownCtLogs.js";
-import { initCache } from "./lib/cache.js";
+import { closeCrtShPgPool } from "./checkers/crtShPg.js";
+import { initCache, consumeCacheStatsWindow } from "./lib/cache.js";
+import { collectWindow as collectMetricsWindow } from "./lib/metrics.js";
 import { MonitoringService, QUEUE_NAME } from "./monitoringService.js";
 import { AlertDispatcher } from "./alertDispatcher.js";
 import { createMonitoringWorker } from "./monitoringWorker.js";
@@ -101,10 +98,46 @@ app.use(cookieParser());
 app.use(express.json());
 
 // ── Security headers ──
+// CSP for the production HTML we serve. Notes on the non-obvious directives:
+//   img-src ... https:   — OAuth avatars come from Google/GitHub CDNs (NavBar).
+//   style-src 'unsafe-inline' — server-rendered /verify and report pages use
+//                               inline <style> blocks and style="" attributes.
+//   script-src 'self'     — the SPA bundle is an external /assets/*.js module;
+//                           the only inline <script> is JSON-LD, which is data
+//                           and exempt from CSP. No 'unsafe-inline' needed.
+//   frame-ancestors 'none' — modern equivalent of X-Frame-Options: DENY.
+const CSP = [
+  "default-src 'self'",
+  "base-uri 'self'",
+  "object-src 'none'",
+  "frame-ancestors 'none'",
+  "img-src 'self' data: https:",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "font-src 'self'",
+  "connect-src 'self'",
+  "form-action 'self'",
+].join("; ");
+
 app.use((_req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader(
+    "Permissions-Policy",
+    "camera=(), microphone=(), geolocation=(), browsing-topics=()",
+  );
+  // HSTS + CSP only in production. In dev, Express serves just /api (the SPA
+  // runs under Vite on :5173) — HSTS would wrongly pin localhost to HTTPS and a
+  // strict CSP would break Vite HMR. Browser↔Cloudflare is HTTPS, so HSTS is
+  // safe here even though the CF→origin hop is Flexible (plaintext).
+  if (isProduction) {
+    res.setHeader(
+      "Strict-Transport-Security",
+      "max-age=31536000; includeSubDomains",
+    );
+    res.setHeader("Content-Security-Policy", CSP);
+  }
   next();
 });
 
@@ -256,5 +289,39 @@ app.listen(PORT, () => {
     );
   }
 });
+
+// ── Cache metrics → Axiom ──
+// Emit a per-interval delta of cache hits/misses as a structured log line. The
+// pino transport ships it to Axiom in production, where it can be aggregated by
+// `keyType` / charted as a hit rate. Skips empty windows so idle periods don't
+// spam the dataset. `.unref()` so this timer never keeps the process alive.
+// Production-only for now — Axiom is the only consumer, so there's nothing to
+// emit in dev.
+const metricsLog = createLogger("metrics");
+const CACHE_METRICS_INTERVAL_MS = 60 * 60_000; // hourly
+const cacheMetricsTimer = isProduction
+  ? setInterval(() => {
+      const window = consumeCacheStatsWindow();
+      if (window) metricsLog.info({ cache: window }, "cache metrics");
+      // App metrics: one flat line per (metric, label-set) for easy APL aggregation.
+      for (const line of collectMetricsWindow()) metricsLog.info(line, "metric");
+    }, CACHE_METRICS_INTERVAL_MS)
+  : null;
+cacheMetricsTimer?.unref();
+
+// ── Graceful shutdown ──
+// Close the crt.sh Postgres pool so in-flight connections drain cleanly on
+// SIGTERM (systemd stop / redeploy) and SIGINT (Ctrl-C in dev).
+let shuttingDown = false;
+async function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log.info({ signal }, "shutting down");
+  if (cacheMetricsTimer) clearInterval(cacheMetricsTimer);
+  await closeCrtShPgPool().catch((err) => log.warn({ err: (err as Error).message }, "crt.sh pg pool close failed"));
+  process.exit(0);
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 export default app;

@@ -49,9 +49,9 @@ export function runAllChecks(
   onResult: (key: string, data: any, cacheAgeMs: number | null) => void,
   onError: (key: string, err: any) => void,
   scanId?: string,
-  crtShFirst?: boolean,
+  ctSource?: import("./types").CtSourcePref,
 ): Promise<void> {
-  const ctExtra = crtShFirst ? "&crtShFirst=1" : "";
+  const ctExtra = ctSource ? `&ctSource=${encodeURIComponent(ctSource)}` : "";
   const groups: CheckGroup[] = [
     { key: "dns", promise: get("dns", domain, noCache, 20000, scanId) },
     { key: "web", promise: get("web", domain, noCache, 30000, scanId) },

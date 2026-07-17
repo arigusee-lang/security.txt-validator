@@ -61,7 +61,9 @@ export async function checkRedirects(domain: string, timeout: number = 5000): Pr
       items.push({ check: "www consistency", status: "pass", detail: `${altDomain} redirects properly`, ref: GOOGLE_HTTPS });
     } else if (altResult.status === 200) {
       wwwBehavior = `Both ${domain} and ${altDomain} serve content`;
-      items.push({ check: "www consistency", status: "warn", detail: `Both ${domain} and ${altDomain} serve content — consider redirecting one to the other`, ref: GOOGLE_HTTPS });
+      // SEO concern (duplicate content for search engines), not a security
+      // issue — surface as info so it doesn't penalize the score.
+      items.push({ check: "www consistency", status: "info", detail: `Both ${domain} and ${altDomain} serve content — consider redirecting one to the other for SEO`, ref: GOOGLE_HTTPS });
     } else {
       wwwBehavior = `${altDomain} returned ${altResult.status}`;
       items.push({ check: "www consistency", status: "info", detail: `${altDomain} returned status ${altResult.status}` });

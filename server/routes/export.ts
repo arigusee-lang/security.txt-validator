@@ -43,7 +43,6 @@ function parsePayload(req: Request): ReportData | null {
     expiry: body.expiry ?? null,
     ct: body.ct ?? null,
     redirects: body.redirects ?? null,
-    seo: body.seo ?? null,
     reputation: body.reputation ?? null,
   };
 }

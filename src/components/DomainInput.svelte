@@ -1,13 +1,16 @@
 <script lang="ts">
   import { createEventDispatcher, onDestroy } from 'svelte';
   import { currentUser } from '../lib/authStore';
+  import type { CtSourcePref } from '../lib/types';
 
-  const dispatch = createEventDispatcher<{ check: { domain: string; noCache: boolean; crtShFirst: boolean } }>();
+  const dispatch = createEventDispatcher<{ check: { domain: string; noCache: boolean; ctSource?: CtSourcePref } }>();
 
   let domain = '';
   let error = '';
   let noCache = false;
-  let crtShFirst = false;
+  // Primary CT source; the other acts as fallback. Defaults to the crt.sh
+  // Postgres mirror (fast, full archive); CertSpotter is the alternate.
+  let ctSource: CtSourcePref = 'crt.sh-pg';
   let settingsOpen = false;
   let settingsWrap: HTMLDivElement;
 
@@ -29,7 +32,7 @@
       return;
     }
     domain = trimmed;
-    dispatch('check', { domain: trimmed, noCache, crtShFirst });
+    dispatch('check', { domain: trimmed, noCache, ctSource });
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -88,10 +91,17 @@
                 <input type="checkbox" bind:checked={noCache} />
                 <span>Skip cache</span>
               </label>
-              <label class="dev-toggle">
-                <input type="checkbox" bind:checked={crtShFirst} />
-                <span>Use crt.sh first</span>
-              </label>
+              <fieldset class="source-group">
+                <legend>CT data source (primary)</legend>
+                <label class="dev-toggle">
+                  <input type="radio" name="ctSource" value="crt.sh-pg" bind:group={ctSource} />
+                  <span>crt.sh (Postgres)</span>
+                </label>
+                <label class="dev-toggle">
+                  <input type="radio" name="ctSource" value="certspotter" bind:group={ctSource} />
+                  <span>CertSpotter</span>
+                </label>
+              </fieldset>
             </div>
           {/if}
         </div>
@@ -245,5 +255,25 @@
   .dev-toggle input {
     accent-color: var(--color-accent);
     cursor: pointer;
+  }
+
+  .source-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    margin: 0;
+    padding: 0.4rem 0 0;
+    border: none;
+    border-top: 1px solid var(--color-border);
+  }
+
+  .source-group legend {
+    font-size: 0.65rem;
+    font-weight: 600;
+    color: var(--color-text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0;
+    margin-bottom: 0.2rem;
   }
 </style>

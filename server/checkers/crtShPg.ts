@@ -1,14 +1,11 @@
 /**
- * Standalone crt.sh Postgres data source.
+ * crt.sh Postgres data source — the PRIMARY CT source for scans.
  *
  * crt.sh exposes a public read-only Postgres at `crt.sh:5432`, db `certwatch`,
  * user `guest` (no password). It serves the same dataset as the web/JSON API
  * but typically responds in 200ms–2s where the HTTP frontend often takes
- * 5–60s or 502s under load.
- *
- * NOT WIRED into the scan flow yet — drop-in alternative to
- * `fetchFromCrtSh` in ctLogsChecker.ts. Return shape matches that fetcher so
- * it can be substituted once the in-flight scan refactor lands.
+ * 5–60s or 502s under load — which is why the HTTP frontend was dropped and
+ * this mirror is now primary, with CertSpotter as the fallback.
  *
  * CLI:
  *   npx tsx server/checkers/crtShPg.ts <domain> [--subdomains]
@@ -18,6 +15,7 @@ import pg from "pg";
 import { fileURLToPath } from "node:url";
 import type { CtLogEntry } from "../types.js";
 import { createLogger } from "../lib/logger.js";
+import { parseIssuerO, CT_MAX_CERTS, CT_RECENT_WINDOW_DAYS } from "./ctNormalize.js";
 
 const log = createLogger("ct-pg");
 
@@ -36,8 +34,10 @@ function getPool(): pg.Pool {
     // crt.sh runs behind a pgbouncer that rejects `statement_timeout` as a
     // startup parameter, so we set the timeout client-side. `query_timeout`
     // sends a cancel-request to the server when the local timer fires.
-    // Keep it below the caller's per-source timeout (HTTP fetcher uses 20s).
-    query_timeout: 20000,
+    // 30s gives mega-domains (e.g. x.com ~7s typical) headroom for load spikes
+    // before failing over to CertSpotter; timeouts aren't retried, so this is
+    // the single worst-case wait on the primary, not a multiple of it.
+    query_timeout: 30000,
   });
   pool.on("error", (err) => log.warn({ err: err.message }, "crt.sh pg pool error"));
   return pool;
@@ -54,6 +54,11 @@ function getPool(): pg.Pool {
  * DISTINCT ON collapses multiple SAN rows per cert; the CASE picks the
  * best matching identity (exact > wildcard > anything-else) so the chosen
  * `name_value` is the most relevant one to the searched domain.
+ *
+ * The `not_after >= now() - $4 days` predicate keeps the query inside the same
+ * recency window the shared finalizeCerts enforces — so we fetch only relevant
+ * certs (valid + recently expired) instead of the full archive. finalizeCerts
+ * still applies the authoritative window; this is the server-side optimisation.
  */
 const SQL = `
   SELECT cert_id, issuer_name, name_value, not_before, not_after
@@ -67,6 +72,7 @@ const SQL = `
     FROM certificate_and_identities cai
     LEFT JOIN ca ON ca.ID = cai.ISSUER_CA_ID
     WHERE plainto_tsquery('certwatch', $1) @@ identities(cai.CERTIFICATE)
+      AND x509_notAfter(cai.CERTIFICATE) >= now() - make_interval(days => $4::int)
       AND (
         lower(cai.NAME_VALUE) = lower($1)
         OR lower(cai.NAME_VALUE) LIKE lower($2)
@@ -82,16 +88,6 @@ const SQL = `
   LIMIT $3
 `;
 
-/** Extract O= from a DN string; crt.sh's `ca.name` is the issuer DN. */
-function parseIssuerO(rawIssuer: string | null | undefined): string {
-  if (!rawIssuer) return "Unknown";
-  if (!/[A-Za-z]+=/.test(rawIssuer)) return rawIssuer;
-  for (const part of rawIssuer.split(/,\s*/)) {
-    if (/^o=/i.test(part)) return part.substring(2).trim().replace(/^"|"$/g, "");
-  }
-  return rawIssuer;
-}
-
 interface PgRow {
   cert_id: string;
   issuer_name: string | null;
@@ -103,14 +99,17 @@ interface PgRow {
 export async function fetchFromCrtShPg(
   domain: string,
   authenticated: boolean,
-  limit = 500,
+  // Fetch with headroom: SQL DISTINCT ON only collapses SAN rows, so precert +
+  // leaf pairs still count against this limit. The caller's shared finalizeCerts
+  // collapses those and caps the result to CT_MAX_CERTS.
+  limit = CT_MAX_CERTS * 2,
 ): Promise<{ certs: CtLogEntry[]; total: number }> {
   // When authenticated, second predicate also matches subdomains via the
   // reverse-index. Without authentication we pass the bare domain twice;
   // the OR collapses to an exact match and the second branch becomes a no-op.
   const subdomainPattern = authenticated ? `%.${domain}` : domain;
   const t0 = Date.now();
-  const res = await getPool().query<PgRow>(SQL, [domain, subdomainPattern, limit]);
+  const res = await getPool().query<PgRow>(SQL, [domain, subdomainPattern, limit, CT_RECENT_WINDOW_DAYS]);
   const elapsed = Date.now() - t0;
 
   const certs: CtLogEntry[] = res.rows.map((r) => ({

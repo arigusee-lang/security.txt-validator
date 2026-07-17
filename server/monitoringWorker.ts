@@ -27,6 +27,7 @@ import {
 import type { AlertDispatcher } from "./alertDispatcher.js";
 import { QUEUE_NAME } from "./monitoringService.js";
 import { createLogger } from "./lib/logger.js";
+import { incr, observe } from "./lib/metrics.js";
 
 const log = createLogger("monitoring-worker");
 
@@ -309,6 +310,8 @@ export async function createMonitoringWorker(
   worker.on("completed", (job) => {
     const data = job.data as MonitorJobData;
     const durationMs = job.processedOn && job.finishedOn ? job.finishedOn - job.processedOn : null;
+    incr("monitor_job", { outcome: "completed", monitorType: data.monitorType });
+    if (durationMs !== null) observe("monitor_job_duration_ms", durationMs, { monitorType: data.monitorType });
     log.info({ jobId: job.id, queue: QUEUE_NAME, domain: data.domain, monitorType: data.monitorType, durationMs }, "job completed");
   });
 
@@ -316,6 +319,7 @@ export async function createMonitoringWorker(
     if (job) {
       const data = job.data as MonitorJobData;
       const durationMs = job.processedOn && job.finishedOn ? job.finishedOn - job.processedOn : null;
+      incr("monitor_job", { outcome: "failed", monitorType: data.monitorType });
       log.error({ jobId: job.id, queue: QUEUE_NAME, domain: data.domain, monitorType: data.monitorType, durationMs, attempt: job.attemptsMade, err: err.message }, "job failed");
       // Update last_error on final failure
       if (job.attemptsMade >= (job.opts?.attempts ?? 3)) {
@@ -325,6 +329,7 @@ export async function createMonitoringWorker(
   });
 
   worker.on("stalled", (jobId) => {
+    incr("monitor_job", { outcome: "stalled" });
     log.warn({ jobId, queue: QUEUE_NAME }, "job stalled");
   });
 

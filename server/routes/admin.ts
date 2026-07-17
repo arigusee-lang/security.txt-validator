@@ -2,6 +2,8 @@ import { Router } from "express";
 import crypto from "node:crypto";
 import type Database from "better-sqlite3";
 import { requireAuth, requireAdmin } from "../middleware/authMiddleware.js";
+import { getCacheStats, resetCacheStats } from "../lib/cache.js";
+import { getMetrics, resetMetrics } from "../lib/metrics.js";
 
 interface AdminDeps {
   db: Database.Database;
@@ -62,6 +64,28 @@ export function createAdminRoutes({ db }: AdminDeps): Router {
     }
 
     res.json({ total, byPlan });
+  });
+
+  // GET /api/admin/cache-stats — cache hit/miss counters since process start
+  router.get("/cache-stats", (_req, res) => {
+    res.json(getCacheStats());
+  });
+
+  // POST /api/admin/cache-stats/reset — zero the counters
+  router.post("/cache-stats/reset", (_req, res) => {
+    resetCacheStats();
+    res.json(getCacheStats());
+  });
+
+  // GET /api/admin/metrics — cumulative app metrics (scans, checks, CT sources, jobs)
+  router.get("/metrics", (_req, res) => {
+    res.json(getMetrics());
+  });
+
+  // POST /api/admin/metrics/reset — zero all app metrics
+  router.post("/metrics/reset", (_req, res) => {
+    resetMetrics();
+    res.json(getMetrics());
   });
 
   // PATCH /api/admin/users/:id/plan — change user plan

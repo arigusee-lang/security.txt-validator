@@ -23,6 +23,113 @@ let prefix = "cache:";
 
 const DEFAULT_FRESH_TTL_MS = 5 * 60 * 1000;
 
+// ── Hit/miss metrics ──────────────────────────────────────────────────────
+// In-process counters for cache effectiveness. Single-process server (scan
+// pipeline + monitoring/maintenance workers all share this module), so plain
+// module-level state captures every read. Only the normal fresh-read paths
+// (cacheGet / cacheGetWithAge) are counted — `cacheGetMaybeStale` is a fallback
+// path with different semantics and is excluded. Reads while Redis is down are
+// not counted at all, so the hit rate stays meaningful when caching is disabled.
+interface CacheCounter {
+  hits: number;
+  misses: number;
+}
+
+const totals: CacheCounter = { hits: 0, misses: 0 };
+const byType = new Map<string, CacheCounter>();
+
+/** Cache keys are `<type>:<rest>` (e.g. `spf:example.com`, `ct:example.com:pg:s0`). */
+function keyType(key: string): string {
+  const i = key.indexOf(":");
+  return i === -1 ? key : key.slice(0, i);
+}
+
+function record(key: string, hit: boolean): void {
+  if (hit) totals.hits++;
+  else totals.misses++;
+  const t = keyType(key);
+  let c = byType.get(t);
+  if (!c) {
+    c = { hits: 0, misses: 0 };
+    byType.set(t, c);
+  }
+  if (hit) c.hits++;
+  else c.misses++;
+}
+
+function withRate(c: CacheCounter): CacheCounter & { total: number; hitRate: number } {
+  const total = c.hits + c.misses;
+  return { ...c, total, hitRate: total > 0 ? c.hits / total : 0 };
+}
+
+export interface CacheStats {
+  hits: number;
+  misses: number;
+  total: number;
+  hitRate: number;
+  enabled: boolean;
+  byType: Record<string, CacheCounter & { total: number; hitRate: number }>;
+}
+
+/** Snapshot of cache hit/miss counters since process start (or last reset). */
+export function getCacheStats(): CacheStats {
+  return {
+    ...withRate(totals),
+    enabled: ready() !== null,
+    byType: Object.fromEntries(
+      [...byType.entries()]
+        .map(([t, c]) => [t, withRate(c)] as const)
+        .sort((a, b) => b[1].total - a[1].total),
+    ),
+  };
+}
+
+/** Reset all hit/miss counters. */
+export function resetCacheStats(): void {
+  totals.hits = 0;
+  totals.misses = 0;
+  byType.clear();
+  lastTotals = { hits: 0, misses: 0 };
+  lastByType.clear();
+}
+
+// ── Windowed deltas for log-based metrics (Axiom) ──────────────────────────
+// The cumulative counters above back the admin endpoint. For Axiom we instead
+// emit a per-interval delta: counts since the previous emit. That makes the
+// log line a discrete sample (easy to sum / rate in APL) instead of an
+// ever-growing cumulative number.
+let lastTotals: CacheCounter = { hits: 0, misses: 0 };
+const lastByType = new Map<string, CacheCounter>();
+
+/**
+ * Return cache hit/miss counts since the last call, then mark the current
+ * cumulative totals as the new baseline. Returns null when nothing happened
+ * in the window so callers can skip emitting an empty log line.
+ */
+export function consumeCacheStatsWindow(): CacheStats | null {
+  const dHits = totals.hits - lastTotals.hits;
+  const dMisses = totals.misses - lastTotals.misses;
+  if (dHits === 0 && dMisses === 0) return null;
+
+  const byTypeDelta: Record<string, CacheCounter & { total: number; hitRate: number }> = {};
+  for (const [t, c] of byType) {
+    const prev = lastByType.get(t) ?? { hits: 0, misses: 0 };
+    const dh = c.hits - prev.hits;
+    const dm = c.misses - prev.misses;
+    if (dh === 0 && dm === 0) continue;
+    byTypeDelta[t] = withRate({ hits: dh, misses: dm });
+    lastByType.set(t, { hits: c.hits, misses: c.misses });
+  }
+
+  lastTotals = { hits: totals.hits, misses: totals.misses };
+
+  return {
+    ...withRate({ hits: dHits, misses: dMisses }),
+    enabled: ready() !== null,
+    byType: byTypeDelta,
+  };
+}
+
 export function initCache(redis: Redis | null, options?: { prefix?: string }): void {
   client = redis;
   if (options?.prefix !== undefined) prefix = options.prefix;
@@ -70,10 +177,14 @@ export async function cacheGet<T>(key: string): Promise<T | null> {
   if (!r) return null;
   try {
     const env = parse<T>(await r.get(prefix + key));
-    if (!env) return null;
-    if (Date.now() > env.freshUntil) return null;
+    if (!env || Date.now() > env.freshUntil) {
+      record(key, false);
+      return null;
+    }
+    record(key, true);
     return env.data;
   } catch {
+    record(key, false);
     return null;
   }
 }
@@ -84,11 +195,15 @@ export async function cacheGetWithAge<T>(key: string): Promise<{ data: T; ageMs:
   if (!r) return null;
   try {
     const env = parse<T>(await r.get(prefix + key));
-    if (!env) return null;
     const now = Date.now();
-    if (now > env.freshUntil) return null;
+    if (!env || now > env.freshUntil) {
+      record(key, false);
+      return null;
+    }
+    record(key, true);
     return { data: env.data, ageMs: now - env.setAt };
   } catch {
+    record(key, false);
     return null;
   }
 }

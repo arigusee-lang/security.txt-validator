@@ -353,7 +353,6 @@ export interface DomainCheckResult {
   blacklist: BlacklistResult;
   ctLogs: CtLogsResult;
   redirects: RedirectResult;
-  seo: SeoResult;
   safeBrowsing: SafeBrowsingResult;
   urlhaus: UrlhausResult;
   danglingDns: DanglingDnsResult;
@@ -376,7 +375,10 @@ export interface CtFinding {
   subdomain?: string;
 }
 
-export type CtDataSource = "crt.sh" | "certspotter" | "none";
+export type CtDataSource = "crt.sh-pg" | "certspotter" | "none";
+
+/** Admin-selectable preferred CT data source (undefined = default chain). */
+export type CtSourcePref = "certspotter" | "crt.sh-pg";
 
 export interface CtLogsResult {
   status: CheckStatus;
@@ -408,21 +410,6 @@ export interface RedirectResult {
   httpsRedirect: boolean;
   wwwBehavior: string | null;
   items: RedirectCheckItem[];
-  error?: string;
-}
-
-// ── SEO ──
-
-export interface SeoCheckItem {
-  check: string;
-  status: CheckStatus;
-  detail: string;
-  ref?: string;
-}
-
-export interface SeoResult {
-  status: CheckStatus;
-  items: SeoCheckItem[];
   error?: string;
 }
 
